@@ -1,0 +1,8 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+config.yaml
+*.pem
+*.key
+outputs/

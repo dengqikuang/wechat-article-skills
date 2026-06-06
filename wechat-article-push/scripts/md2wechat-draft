@@ -1,0 +1,162 @@
+#!/usr/bin/env node
+'use strict';
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// 支持两种用法：
+//   md2wechat-draft "<标题>" "<摘要>" <markdown文件> [封面图]
+//   md2wechat-draft --html "<标题>" "<摘要>" <html文件> [封面图]
+
+const args = process.argv.slice(2);
+let useHtml = false;
+let TITLE, DIGEST, CONTENT_FILE, COVER_FILE;
+
+if (args[0] === '--html') {
+  useHtml = true;
+  TITLE = args[1] || '未命名文章';
+  DIGEST = args[2] || '';
+  CONTENT_FILE = args[3];
+  COVER_FILE = args[4];
+} else {
+  TITLE = args[0] || '未命名文章';
+  DIGEST = args[1] || '';
+  CONTENT_FILE = args[2];
+  COVER_FILE = args[3];
+}
+
+if (!CONTENT_FILE || !fs.existsSync(CONTENT_FILE)) {
+  if (useHtml) {
+    console.error('用法: md2wechat-draft --html "<标题>" "<摘要>" <html文件> [封面图]');
+  } else {
+    console.error('用法: md2wechat-draft "<标题>" "<摘要>" <markdown文件> [封面图]');
+  }
+  process.exit(1);
+}
+
+function getConfig() {
+  const f = path.join(process.env.HOME, '.config/md2wechat/config.yaml');
+  if (!fs.existsSync(f)) return {};
+  const c = fs.readFileSync(f, 'utf8');
+  return {
+    appid:  (c.match(/appid:\s*([a-zA-Z0-9]+)/) || [])[1] || '',
+    secret: (c.match(/secret:\s*([a-zA-Z0-9]+)/) || [])[1] || ''
+  };
+}
+
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const opts = { hostname: u.hostname, path: u.pathname + u.search, method: 'GET' };
+    https.get(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve(JSON.parse(d)));
+    }).on('error', reject);
+  });
+}
+
+function httpsPost(hostname, pathAndQuery, payload) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(payload);
+    const opts = {
+      hostname, path: pathAndQuery, method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(data) }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve(d));
+    });
+    req.on('error', reject);
+    req.write(data); req.end();
+  });
+}
+
+function uploadMultipart(pathAndQuery, filePath) {
+  return new Promise((resolve, reject) => {
+    const ext = path.extname(filePath).slice(1).toLowerCase();
+    const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' }[ext] || 'application/octet-stream';
+    const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+    const fileBuffer = fs.readFileSync(filePath);
+    const filename = path.basename(filePath);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n`),
+      fileBuffer,
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    ]);
+    const u = new URL('https://api.weixin.qq.com' + pathAndQuery);
+    const opts = {
+      hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+    };
+    const req = https.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve(JSON.parse(d)));
+    });
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+async function main() {
+  const { appid, secret } = getConfig();
+  const finalAppid = process.env.WECHAT_APPID || appid || '';
+  const finalSecret = process.env.WECHAT_SECRET || secret || '';
+  if (!finalAppid || !finalSecret) { console.error('缺少 appid/secret'); process.exit(1); }
+
+  // 1. token
+  console.log('📡 获取 access_token...');
+  const tokenData = await httpsGet(`https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${finalAppid}&secret=${finalSecret}`);
+  if (!tokenData.access_token) { console.error('Token 失败:', JSON.stringify(tokenData)); process.exit(1); }
+  const token = tokenData.access_token;
+  console.log('✅ Token OK');
+
+  // 2. 封面
+  let thumbMediaId = '';
+  if (COVER_FILE && fs.existsSync(COVER_FILE)) {
+    console.log('🖼️ 上传封面...');
+    const r = await uploadMultipart(`/cgi-bin/material/add_material?access_token=${token}&type=image`, COVER_FILE);
+    if (r.media_id) { thumbMediaId = r.media_id; console.log('✅ 封面:', thumbMediaId); }
+    else console.log('⚠️ 封面上传失败:', JSON.stringify(r));
+  }
+
+  // 3. 内容转换
+  console.log('📝 ' + (useHtml ? '读取 HTML...' : 'Markdown → HTML...'));
+  let html;
+  if (useHtml) {
+    // 直接读取 HTML 文件内容（应包含 <section>...</section> 完整结构）
+    html = fs.readFileSync(CONTENT_FILE, 'utf8');
+  } else {
+    // 用 marked 转换 Markdown（去掉文章标题那一行）
+    const markedPath = path.join(execSync('npm root -g').toString().trim(), 'marked');
+    const markedFn = require(markedPath);
+    const mdContent = fs.readFileSync(CONTENT_FILE, 'utf8');
+    html = markedFn.parse(mdContent.replace(/^#\s+.+\n+/, ''));
+  }
+  console.log('✅ HTML 长度:', html.length);
+
+  // 4. 推送草稿
+  console.log('🚀 推送草稿...');
+  const draftResp = await httpsPost('api.weixin.qq.com', `/cgi-bin/draft/add?access_token=${token}`, {
+    articles: [{
+      title: TITLE,
+      author: '',
+      digest: DIGEST,
+      content: html,
+      content_source_url: '',
+      thumb_media_id: thumbMediaId,
+      need_open_comment: 0,
+      only_fans_can_comment: 0
+    }]
+  });
+
+  const draftData = JSON.parse(draftResp);
+  if (draftData.errcode === 0 || draftData.media_id) {
+    console.log('✅✅✅ 草稿推送成功！');
+  } else {
+    console.error('❌ 推送失败:', draftResp);
+    process.exit(1);
+  }
+}
+
+main().catch(e => { console.error('异常:', e.message); process.exit(1); });
